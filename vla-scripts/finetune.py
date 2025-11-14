@@ -30,7 +30,9 @@ import torch
 import torch.distributed as dist
 import tqdm
 from accelerate import PartialState
-from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training, TaskType, LNTuningConfig
+from peft import PrefixTuningConfig
+from peft import OFTConfig
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
@@ -101,7 +103,16 @@ class FinetuneConfig:
     lora_dropout: float = 0.0                                       # Dropout applied to LoRA weights
     use_quantization: bool = False                                  # Whether to 4-bit quantize VLA for LoRA fine-tuning
                                                                     #   => CAUTION: Reduces memory but hurts performance
+    use_lntuning: bool = False  
 
+    use_prefix_tuning: bool = False                                # Whether to use Prefix-Tuning fine-tuning
+    prefix_tuning_num_virtual_tokens: int = 20                      # Number of virtual tokens for
+     
+    use_oft: bool = False                                  # Whether to use OFT fine-tuning
+    oft_rank: int = 32                                             # Rank of OFT weight matrix
+    oft_dropout: float = 0.0       
+                                   
+    use_svf: bool = False                                  # Whether to use LN-Tuning fine-tuning
     # Tracking Parameters
     wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
     wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
@@ -128,6 +139,14 @@ def finetune(cfg: FinetuneConfig) -> None:
     )
     if cfg.use_lora:
         exp_id += f"+lora-r{cfg.lora_rank}+dropout-{cfg.lora_dropout}"
+    if cfg.use_svf:
+        exp_id += f"+svf-r{cfg.svf_rank}+dropout-{cfg.svf_dropout}"
+    if cfg.use_lntuning:
+        exp_id += f"+lntuning-causallm"
+    if cfg.use_prefix_tuning:
+        exp_id += f"+prefix-tuning-{cfg.prefix_tuning_num_virtual_tokens}"
+    if cfg.use_oft:
+        exp_id += f"+oft-r{cfg.oft_rank}+dropout-{cfg.oft_dropout}"
     if cfg.use_quantization:
         exp_id += "+q-4bit"
     if cfg.run_id_note is not None:
@@ -162,6 +181,11 @@ def finetune(cfg: FinetuneConfig) -> None:
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
+    
+    for name, module in vla.named_modules():
+        print(name, "->", module.__class__.__name__)
+    
+
 
     # Device Placement =>> note that BitsAndBytes automatically handles for quantized training
     if cfg.use_quantization:
@@ -180,7 +204,50 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
         vla = get_peft_model(vla, lora_config)
         vla.print_trainable_parameters()
+    """
+    if cfg.use_svf:
+        svf_config = SVFConfig(
+            r=cfg.svf_rank,
+            svf_alpha=min(cfg.svf_rank, 16),
+            svf_dropout=cfg.svf_dropout,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            init_svf_weights="gaussian",
+        )
+        vla = get_peft_model(vla, svf_config)
+        vla.print_trainable_parameters()
+    """
+    if cfg.use_lntuning:
+        lntuning_config = LNTuningConfig(
+            task_type=TaskType.CAUSAL_LM,
+        )
+        vla = get_peft_model(vla, lntuning_config)
+        vla.print_trainable_parameters()
 
+    if cfg.use_prefix_tuning:
+        token_dim = vla.language_model.get_input_embeddings().embedding_dim
+        num_attention_heads = vla.language_model.config.num_attention_heads
+        vla.config.vocab_size = vla.language_model.config.vocab_size
+        prefix_tuning_config = PrefixTuningConfig(
+            task_type=TaskType.CAUSAL_LM,
+            num_virtual_tokens=cfg.prefix_tuning_num_virtual_tokens,
+            inference_mode=False,        
+            encoder_hidden_size=None,
+            num_layers=32,
+            token_dim=token_dim,
+            num_attention_heads=num_attention_heads,
+        )
+        vla.language_model = get_peft_model(vla.language_model, prefix_tuning_config)
+        vla.language_model.print_trainable_parameters()
+    
+    if cfg.use_oft:
+        oft_config = OFTConfig(
+            r=cfg.oft_rank,
+            module_dropout=cfg.oft_dropout,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            init_weights=True,
+        )
+        vla = get_peft_model(vla, oft_config)
+        vla.print_trainable_parameters()
     # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
     vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
 
