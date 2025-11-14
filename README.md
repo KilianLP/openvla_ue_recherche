@@ -40,3 +40,32 @@ python -m pip install --no-build-isolation -v "flash-attn==2.6.3"
 
 You can find the beginning of the bibliography in the file **Bibliography.pdf**.
 
+
+## Download data
+
+To download the data, first go to the dataset directory:
+
+```bash
+cd modified_libero_rlds
+```
+
+Then run:
+
+```bash
+python - <<'PY'
+from huggingface_hub import snapshot_download
+
+snapshot_download(
+    repo_id="openvla/modified_libero_rlds",
+    repo_type="dataset",
+    local_dir="/home/k23preus/UE_rechrche/modified_libero_rlds",
+    local_dir_use_symlinks=False,
+    allow_patterns=["libero_object_no_noops/1.0.0/*"],
+)
+PY
+```
+---
+
+## Launching training and evaluation in the background
+
+You can use the bash scripts in the **bash_scripts/** directory to launch both the training and evaluation of a model in the background. These scripts use nohup, so the processes keep running even after you close the terminal.
