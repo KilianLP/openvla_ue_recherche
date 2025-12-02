@@ -3,10 +3,12 @@
 import json
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 import tensorflow as tf
 import torch
+from peft import PeftModel
 from PIL import Image
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 
@@ -33,6 +35,7 @@ def get_vla(cfg):
     # Load VLA checkpoint.
     print("[*] Instantiating Pretrained VLA model")
     print("[*] Loading in BF16 with Flash-Attention Enabled")
+    print("[*] Low CPU Memory Usage Enabled 300")
 
     # Register OpenVLA model to HF Auto Classes (not needed if the model is on HF Hub)
     AutoConfig.register("openvla", OpenVLAConfig)
@@ -40,8 +43,14 @@ def get_vla(cfg):
     AutoProcessor.register(OpenVLAConfig, PrismaticProcessor)
     AutoModelForVision2Seq.register(OpenVLAConfig, OpenVLAForActionPrediction)
 
+    base_ckpt_path = cfg.pretrained_checkpoint
+    adapter_path = Path(cfg.adapter_path) if getattr(cfg, "adapter_path", None) else None
+    
+    # If the adapter path already contains a merged model (config + weights), prefer loading from it
+    model_load_path = adapter_path if adapter_path is not None and (adapter_path / "config.json").exists() else base_ckpt_path
+    print(adapter_path, model_load_path)
     vla = AutoModelForVision2Seq.from_pretrained(
-        cfg.pretrained_checkpoint,
+        base_ckpt_path,
         attn_implementation="flash_attention_2",
         torch_dtype=torch.bfloat16,
         load_in_8bit=cfg.load_in_8bit,
@@ -49,6 +58,17 @@ def get_vla(cfg):
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
+    
+    # Optionally load and merge a LoRA adapter (adapter_path points to saved adapter or merged run dir)
+    if adapter_path is not None and adapter_path.exists():
+        adapter_config = adapter_path / "adapter_config.json"
+        if adapter_config.exists():
+            vla = PeftModel.from_pretrained(vla, adapter_path)
+            #print(vla)
+            vla = vla.merge_and_unload()
+        else:
+            # If no adapter config, assume weights are already merged in the adapter_path directory
+            pass
 
     # Move model to device.
     # Note: `.to()` is not supported for 8-bit or 4-bit bitsandbytes models, but the model will
@@ -57,25 +77,91 @@ def get_vla(cfg):
         vla = vla.to(DEVICE)
 
     # Load dataset stats used during finetuning (for action un-normalization).
-    dataset_statistics_path = os.path.join(cfg.pretrained_checkpoint, "dataset_statistics.json")
-    if os.path.isfile(dataset_statistics_path):
-        with open(dataset_statistics_path, "r") as f:
-            norm_stats = json.load(f)
-        vla.norm_stats = norm_stats
-    else:
+    adapter_path = Path(base_ckpt_path) if adapter_path is None else adapter_path
+    stats_candidates = []
+    if adapter_path is not None:
+        stats_candidates.append(adapter_path / "dataset_statistics.json")
+    #stats_candidates.append(Path(base_ckpt_path) / "dataset_statistics.json")
+    stats_loaded = False
+    for p in stats_candidates:
+        if p.is_file():
+            with open(p, "r") as f:
+                print(f"[*] Loading dataset statistics from {str(p)} 4000")
+                stats = json.load(f)
+                vla.norm_stats = stats
+                vla.base_model.norm_stats = stats  
+                vla.config.dataset_statistics = stats
+                vla.base_model.config.dataset_statistics = stats
+                #vla.model.dataset_statistics = stats
+                #vla.base_model.model.dataset_statistics = stats
+                #vla.base_model.model.norm_stats = stats
+            stats_loaded = True
+            break
+    print(vla.norm_stats.keys() if stats_loaded else "No dataset statistics loaded.")
+    if not stats_loaded:
         print(
             "WARNING: No local dataset_statistics.json file found for current checkpoint.\n"
             "You can ignore this if you are loading the base VLA (i.e. not fine-tuned) checkpoint."
             "Otherwise, you may run into errors when trying to call `predict_action()` due to an absent `unnorm_key`."
         )
+    def print_all_stats(vla):
+        print("\n================= ALL STATS IN MODEL =================\n")
+
+        # 1 — top-level PEFT wrapper
+        print("vla.norm_stats:", getattr(vla, "norm_stats", None))
+
+        # 2 — base model
+        if hasattr(vla, "base_model"):
+            print("\n[base_model]")
+            print("base_model.norm_stats:", getattr(vla.base_model, "norm_stats", None))
+
+        # 3 — nested model (OpenVLAForActionPrediction)
+        if hasattr(vla, "model"):
+            print("\n[self.model]")
+            print("self.model.dataset_statistics:", getattr(vla.model, "dataset_statistics", None))
+            print("self.model.norm_stats:", getattr(vla.model, "norm_stats", None))
+
+        if hasattr(vla, "base_model") and hasattr(vla.base_model, "model"):
+            print("\n[base_model.model]")
+            print("base_model.model.dataset_statistics:", getattr(vla.base_model.model, "dataset_statistics", None))
+            print("base_model.model.norm_stats:", getattr(vla.base_model.model, "norm_stats", None))
+
+        # 4 — search every submodule recursively
+        print("\n[Recursive search for anything named 'stats']")
+
+        for name, module in vla.named_modules():
+            for attr in ["norm_stats", "dataset_statistics", "stats"]:
+                if hasattr(module, attr):
+                    value = getattr(module, attr)
+                    if isinstance(value, dict):
+                        print(f"\nFound in module: {name}.{attr}")
+                        print("Keys:", list(value.keys()))
+
+        print("\n================= END ALL STATS =================\n")
+        
+    # print_all_stats(vla)
+
 
     return vla
 
 
 def get_processor(cfg):
     """Get VLA model's Hugging Face processor."""
-    processor = AutoProcessor.from_pretrained(cfg.pretrained_checkpoint, trust_remote_code=True)
-    return processor
+    candidates = []
+    if getattr(cfg, "adapter_path", None):
+        candidates.append(Path(cfg.adapter_path))
+    candidates.append(Path(cfg.pretrained_checkpoint))
+
+    last_error = None
+    for root in candidates:
+        try:
+            return AutoProcessor.from_pretrained(root, trust_remote_code=True)
+        except OSError as e:
+            last_error = e
+            continue
+
+    # If we made it here, re-raise the last error for visibility
+    raise last_error
 
 
 def crop_and_resize(image, crop_scale, batch_size):
@@ -164,7 +250,6 @@ def get_vla_action(vla, processor, base_vla_name, obs, task_label, unnorm_key, c
 
     # Process inputs.
     inputs = processor(prompt, image).to(DEVICE, dtype=torch.bfloat16)
-
-    # Get action.
+    
     action = vla.predict_action(**inputs, unnorm_key=unnorm_key, do_sample=False)
     return action

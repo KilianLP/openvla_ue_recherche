@@ -23,7 +23,7 @@ import os
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import draccus
 import torch
@@ -32,6 +32,7 @@ import tqdm
 from accelerate import PartialState
 from peft import LoraConfig, PeftModel, get_peft_model, prepare_model_for_kbit_training, TaskType, LNTuningConfig
 from peft import PrefixTuningConfig
+from peft import IA3Config
 from peft import OFTConfig
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
@@ -86,7 +87,7 @@ class FinetuneConfig:
     adapter_tmp_dir: Path = Path("adapter-tmp")                     # Temporary directory for LoRA weights before fusing
 
     # Fine-tuning Parameters
-    batch_size: int = 16                                            # Fine-tuning batch size
+    batch_size: int = 16                                           # Fine-tuning batch size
     max_steps: int = 200_000                                        # Max number of fine-tuning steps
     save_steps: int = 5000                                          # Interval for checkpoint saving
     learning_rate: float = 5e-4                                     # Fine-tuning learning rate
@@ -109,10 +110,14 @@ class FinetuneConfig:
     prefix_tuning_num_virtual_tokens: int = 20                      # Number of virtual tokens for
      
     use_oft: bool = False                                  # Whether to use OFT fine-tuning
-    oft_rank: int = 32                                             # Rank of OFT weight matrix
-    oft_dropout: float = 0.0       
+    oft_rank: int = 32                                        
+    oft_dropout: float = 0.0   
+    
+    use_ia3: bool = False
+    ia3_target_modules: Optional[List[str]] = None    
                                    
     use_svf: bool = False                                  # Whether to use LN-Tuning fine-tuning
+    ln_target_modules: Optional[List[str]] = None                    # LayerNorm module names to tune (autodetect if None)
     # Tracking Parameters
     wandb_project: str = "openvla"                                  # Name of W&B project to log to (use default!)
     wandb_entity: str = "stanford-voltron"                          # Name of entity to log under
@@ -217,8 +222,16 @@ def finetune(cfg: FinetuneConfig) -> None:
         vla.print_trainable_parameters()
     """
     if cfg.use_lntuning:
+        # If target modules not provided, tune all LayerNorm modules
+        target_modules = cfg.ln_target_modules
+        if target_modules is None:
+            target_modules = [name for name, module in vla.named_modules() if isinstance(module, torch.nn.LayerNorm)]
+            if len(target_modules) == 0:
+                raise ValueError("LN-Tuning requested but no LayerNorm modules were found to target.")
+
         lntuning_config = LNTuningConfig(
             task_type=TaskType.CAUSAL_LM,
+            target_modules=target_modules,
         )
         vla = get_peft_model(vla, lntuning_config)
         vla.print_trainable_parameters()
@@ -248,6 +261,20 @@ def finetune(cfg: FinetuneConfig) -> None:
         )
         vla = get_peft_model(vla, oft_config)
         vla.print_trainable_parameters()
+        
+    if cfg.use_ia3:
+        target_modules = cfg.ia3_target_modules
+        # Auto-detecter si None → on applique IA3 sur les projections attentionnelles
+        if target_modules is None:
+            target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "down_proj", "up_proj"]
+
+        ia3_config = IA3Config(
+            target_modules=target_modules,
+            feedforward_modules=["gate_proj", "up_proj", "down_proj"],  # modules MLP où IA3 doit agir
+        )
+        vla = get_peft_model(vla, ia3_config)
+        vla.print_trainable_parameters()
+    
     # Wrap VLA in PyTorch DDP Wrapper for Multi-GPU Training
     vla = DDP(vla, device_ids=[device_id], find_unused_parameters=True, gradient_as_bucket_view=True)
 
@@ -401,7 +428,7 @@ def finetune(cfg: FinetuneConfig) -> None:
 
                 # Merge LoRA weights into model backbone for faster inference
                 #   =>> Note that merging is slow and can be done post-hoc to speed up training
-                if cfg.use_lora:
+                if cfg.use_lora or cfg.use_oft:
                     base_vla = AutoModelForVision2Seq.from_pretrained(
                         cfg.vla_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, trust_remote_code=True
                     )

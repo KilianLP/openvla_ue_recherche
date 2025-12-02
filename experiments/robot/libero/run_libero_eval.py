@@ -49,6 +49,8 @@ from experiments.robot.robot_utils import (
     normalize_gripper_action,
     set_seed_everywhere,
 )
+import experiments.robot.robot_utils as r
+print("this is the directory", r.__file__)
 
 
 @dataclass
@@ -61,8 +63,9 @@ class GenerateConfig:
     model_family: str = "openvla"                    # Model family
     pretrained_checkpoint: Union[str, Path] = ""     # Pretrained checkpoint path
     load_in_8bit: bool = False                       # (For OpenVLA only) Load with 8-bit quantization
-    load_in_4bit: bool = False                       # (For OpenVLA only) Load with 4-bit quantization
-
+    load_in_4bit: bool = False                      # (For OpenVLA only) Load with 4-bit quantization
+    
+    adapter_path: Optional[Union[str, Path]] = None  # (For OpenVLA only) LoRA adapter path
     center_crop: bool = True                         # Center crop? (if trained w/ random crop image aug)
 
     #################################################################################################################
@@ -90,7 +93,7 @@ class GenerateConfig:
 @draccus.wrap()
 def eval_libero(cfg: GenerateConfig) -> None:
     assert cfg.pretrained_checkpoint is not None, "cfg.pretrained_checkpoint must not be None!"
-    if "image_aug" in cfg.pretrained_checkpoint:
+    if "image_aug" in str(cfg.pretrained_checkpoint) or ("image_aug" in str(cfg.adapter_path) if cfg.adapter_path else False):
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
 
@@ -101,7 +104,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
     cfg.unnorm_key = cfg.task_suite_name
 
     # Load model
+    print("[*] Loading pretrained VLA model... jher")
     model = get_model(cfg)
+    print("[*] Pretrained VLA model loaded. dijezjd")
 
     # [OpenVLA] Check that the model contains the action un-normalization key
     if cfg.model_family == "openvla":
@@ -109,7 +114,9 @@ def eval_libero(cfg: GenerateConfig) -> None:
         # with the suffix "_no_noops" in the dataset name)
         if cfg.unnorm_key not in model.norm_stats and f"{cfg.unnorm_key}_no_noops" in model.norm_stats:
             cfg.unnorm_key = f"{cfg.unnorm_key}_no_noops"
-        assert cfg.unnorm_key in model.norm_stats, f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`!"
+        print(f"[*] Using action un-normalization key: {cfg.unnorm_key}")
+        if cfg.pretrained_checkpoint != "openvla/openvla-7b":
+            assert cfg.unnorm_key in model.norm_stats, f"Action un-norm key {cfg.unnorm_key} not found in VLA `norm_stats`!"
 
     # [OpenVLA] Get Hugging Face processor
     processor = None
